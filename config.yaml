@@ -1,0 +1,43 @@
+# ABOUTME: Configuration file for typing pattern analyzer with comprehensive settings
+# Advanced macOS Typing Pattern Analyzer Configuration
+
+collection:
+  sample_rate_hz: 1000
+  pause_thresholds: [0.5, 1.0, 2.0, 5.0]
+  buffer_size: 10000
+  save_interval_seconds: 60
+  data_retention_days: 30
+  
+analysis:
+  min_session_duration: 30
+  hesitation_threshold: 0.8
+  burst_threshold: 0.15
+  flow_state_threshold: 60
+  accuracy_window_size: 100
+  
+reporting:
+  export_formats: ['html', 'csv', 'json']
+  visualization_types: ['heatmap', 'timeline', 'distribution', 'correlation']
+  report_frequency: 'daily'
+  
+privacy:
+  capture_all_content: true
+  store_passwords: true
+  full_context_tracking: true
+  window_title_capture: true
+  
+performance:
+  max_cpu_usage_percent: 1.0
+  max_memory_mb: 100
+  data_compression: true
+  
+keyboard:
+  layout: 'qwerty'
+  custom_mappings: {}
+  finger_assignments: 'standard'
+  
+output:
+  data_directory: './data'
+  reports_directory: './reports'
+  log_level: 'INFO'
+  console_output: true
