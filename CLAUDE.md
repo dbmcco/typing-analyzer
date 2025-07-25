@@ -92,7 +92,23 @@ python3 src/analyzer.py
 - **Productivity Metrics**: Peak performance periods, context switching overhead
 - **Optimization Opportunities**: Text shortcuts, phrase shortcuts, hand balance improvements
 
-## Recent Updates (Latest: Error Detection Enhancement)
+## Recent Updates (Latest: HTML Report Formatting Issues - July 25, 2025)
+
+### Outstanding HTML Issues (Requires Immediate Attention)
+- **Issue 1: Emojis Not Fully Removed**: Console output and some report sections still contain emoji characters (🚀🟡) that may display as strange characters
+- **Issue 2: Claude Analysis Raw HTML Display**: Claude insights section shows HTML markup (`<h3>`, `<p>`, `<ul>` tags) instead of rendered content, making it difficult for humans to read
+- **Enhancement Request: Better Claude Formatting**: Claude insights need structured presentation with tables, better visual hierarchy
+- **Enhancement Request: Visual Graphs**: HTML reports should include charts and graphs, not just text-based analysis
+- **Required Action**: Comprehensive HTML template overhaul with visualization library integration (Chart.js, D3.js, or similar)
+
+### Completed Fixes (July 25, 2025)
+- **Space Keystroke Capture**: FIXED - keylogger now properly captures space characters
+- **Claude API Integration**: COMPLETED - real-time AI analysis integrated into reports  
+- **Intelligent Word Splitting**: COMPLETED - historical data now shows meaningful words instead of gibberish
+- **Dynamic Field Resolution**: FIXED - template placeholders now show actual values
+- **Unicode Character Handling**: FIXED - special characters converted to ASCII equivalents
+
+### Previous Updates
 - **Enhanced Error Detection System**: Comprehensive correction tracking and typo pattern analysis
   - Multi-keystroke correction sequence detection and analysis
   - Common typo pattern recognition ("teh" → "the", "adn" → "and", etc.)

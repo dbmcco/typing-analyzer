@@ -41,3 +41,12 @@ output:
   reports_directory: './reports'
   log_level: 'INFO'
   console_output: true
+  
+claude_api:
+  api_key: ''  # Set via CLAUDE_API_KEY environment variable
+  api_base: 'https://api.anthropic.com'
+  model: 'claude-3-5-sonnet-20241022'
+  max_tokens: 2000
+  temperature: 0.3
+  timeout_seconds: 30
+  enabled: true

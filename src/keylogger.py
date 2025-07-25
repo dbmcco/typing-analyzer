@@ -200,7 +200,18 @@ class TypingAnalyzerKeylogger:
             elif hasattr(key, "name"):
                 # Special key
                 key_code = hash(key.name)
-                return key_code, "", key.name
+                key_name = key.name
+                
+                # Convert special keys to their character representation
+                if key_name == "space":
+                    return key_code, " ", "space"
+                elif key_name == "tab":
+                    return key_code, "\t", "tab"
+                elif key_name == "enter":
+                    return key_code, "\n", "enter"
+                else:
+                    # Other special keys (backspace, delete, etc.)
+                    return key_code, "", key_name
             else:
                 # Fallback
                 return hash(str(key)), "", str(key)

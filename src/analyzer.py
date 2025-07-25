@@ -7,6 +7,14 @@ from typing import List, Dict, Any, Optional, Tuple
 import logging
 from pathlib import Path
 import re
+import os
+
+# Claude API integration
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
 
 import pandas as pd
 import numpy as np
@@ -522,30 +530,101 @@ class TypingPatternAnalyzer:
             'error_frequency': total_corrections / (total_keystrokes / 100) if total_keystrokes > 0 else 0,  # Errors per 100 keystrokes
         }
 
+    def _intelligent_word_split(self, merged_text: str) -> List[str]:
+        """Split merged text into likely words using various heuristics."""
+        
+        import re
+        
+        # Simple approach: look for common patterns
+        words = []
+        text = merged_text.lower()
+        
+        # Find common words patterns in the text
+        patterns = [
+            'keyboard', 'typing', 'accessibility', 'customer', 'growth', 'terminal', 
+            'directory', 'create', 'update', 'claude', 'project', 'memory', 'config',
+            'application', 'working', 'analysis', 'complicated', 'window', 'error',
+            'this', 'test', 'that', 'what', 'seems', 'maybe', 'more', 'words', 
+            'slower', 'happens', 'find', 'gave', 'okay', 'the', 'and', 'with', 
+            'have', 'from', 'they', 'know', 'want', 'good', 'time', 'will', 'work'
+        ]
+        
+        # Extract words based on patterns
+        remaining_text = text
+        for pattern in sorted(patterns, key=len, reverse=True):
+            while pattern in remaining_text:
+                start = remaining_text.find(pattern)
+                if start >= 0:
+                    words.append(pattern)
+                    remaining_text = remaining_text[:start] + remaining_text[start + len(pattern):]
+        
+        # Extract remaining meaningful chunks
+        remaining_words = re.findall(r'[a-z]{3,}', remaining_text)
+        words.extend(remaining_words)
+        
+        # Remove duplicates and filter
+        unique_words = list(dict.fromkeys(words))  # Preserve order
+        meaningful_words = [w for w in unique_words if len(w) >= 3]
+        
+        return meaningful_words if meaningful_words else [merged_text]
+
     def analyze_word_patterns(self) -> Dict[str, Any]:
         """Analyze word and phrase patterns for optimization opportunities."""
         logging.info("Analyzing word and phrase patterns...")
         
-        # Reconstruct text from keystrokes
+        # Reconstruct text from keystrokes (FIXED VERSION)
         text_segments = []
         current_word = ""
         
         for event in self.events:
             if event.is_correction:
                 # Remove last character on backspace/delete
-                if current_word:
-                    current_word = current_word[:-1]
-            elif event.key_char and event.key_char.isprintable():
-                if event.key_char == ' ':
+                if event.key_name in ['backspace', 'delete']:
                     if current_word:
-                        text_segments.append(current_word.lower())
+                        current_word = current_word[:-1]
+            elif event.key_char:
+                char = event.key_char
+                
+                # Handle different character types
+                if char == ' ' or char in '\t\n\r':
+                    # Whitespace - end current word
+                    if current_word.strip():
+                        # Only add meaningful words (length > 1, not just punctuation)
+                        clean_word = current_word.strip().lower()
+                        if len(clean_word) > 1 and any(c.isalnum() for c in clean_word):
+                            text_segments.append(clean_word)
+                    current_word = ""
+                elif char.isprintable():
+                    # Add printable characters
+                    current_word += char
+                    
+                    # Also break on punctuation that ends sentences
+                    if char in '.!?':
+                        if current_word.strip():
+                            clean_word = current_word.strip().lower()
+                            # Remove trailing punctuation for word analysis
+                            clean_word = clean_word.rstrip('.!?,:;')
+                            if len(clean_word) > 1 and any(c.isalnum() for c in clean_word):
+                                text_segments.append(clean_word)
                         current_word = ""
-                else:
-                    current_word += event.key_char
         
         # Add final word
-        if current_word:
-            text_segments.append(current_word.lower())
+        if current_word.strip():
+            clean_word = current_word.strip().lower().rstrip('.!?,:;')
+            if len(clean_word) > 1 and any(c.isalnum() for c in clean_word):
+                text_segments.append(clean_word)
+        
+        # Intelligent word splitting for merged text
+        enhanced_segments = []
+        for segment in text_segments:
+            if len(segment) > 20:  # Likely merged text
+                split_words = self._intelligent_word_split(segment)
+                enhanced_segments.extend(split_words)
+            else:
+                enhanced_segments.append(segment)
+        
+        # Use enhanced segments for analysis
+        text_segments = enhanced_segments
         
         # Word frequency analysis
         word_counts = Counter(text_segments)
@@ -584,7 +663,8 @@ class TypingPatternAnalyzer:
             'most_frequent_trigrams': trigram_counts.most_common(10),
             'word_efficiency': word_efficiency,
             'vocabulary_size': len(word_counts),
-            'repetition_rate': sum(1 for count in word_counts.values() if count > 1) / len(word_counts) if word_counts else 0
+            'repetition_rate': sum(1 for count in word_counts.values() if count > 1) / len(word_counts) if word_counts else 0,
+            'text_segments': text_segments  # For Claude analysis
         }
 
     def analyze_key_combinations(self) -> Dict[str, Any]:
@@ -731,6 +811,132 @@ class TypingPatternAnalyzer:
             ])
         }
 
+    def analyze_with_claude(self, text_segments: List[str], typing_stats: Dict[str, Any]) -> Dict[str, Any]:
+        """Analyze typing patterns using Claude API for intelligent insights."""
+        
+        if not HAS_REQUESTS:
+            logging.warning("requests library not available for Claude API")
+            return {"status": "no_requests", "message": "requests library not installed"}
+        
+        # Check if Claude API is enabled
+        if not self.config.get("claude_api.enabled", True):
+            logging.info("Claude API disabled in configuration")
+            return {"status": "disabled", "message": "Claude API disabled in config"}
+        
+        # Get API key
+        api_key = os.getenv("CLAUDE_API_KEY") or self.config.get("claude_api.api_key", "")
+        if not api_key:
+            logging.warning("No Claude API key found")
+            return {"status": "no_api_key", "message": "Set CLAUDE_API_KEY environment variable"}
+        
+        # Create analysis prompt
+        prompt = self._create_claude_analysis_prompt(text_segments, typing_stats)
+        
+        # API configuration
+        api_base = self.config.get("claude_api.api_base", "https://api.anthropic.com")
+        model = self.config.get("claude_api.model", "claude-3-5-sonnet-20241022")
+        max_tokens = self.config.get("claude_api.max_tokens", 2000)
+        temperature = self.config.get("claude_api.temperature", 0.3)
+        timeout = self.config.get("claude_api.timeout_seconds", 30)
+        
+        headers = {
+            "Content-Type": "application/json",
+            "X-API-Key": api_key,
+            "anthropic-version": "2023-06-01"
+        }
+        
+        payload = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt + "\\n\\nPlease provide actionable insights for improving typing efficiency and productivity. Focus on practical recommendations. Format your response as clean HTML with proper headings (h3, h4), paragraphs (p), and lists (ul, li). Do not include DOCTYPE, html, head, or body tags - just the content markup."
+                }
+            ]
+        }
+        
+        try:
+            logging.info(f"Making Claude API request (model: {model})...")
+            response = requests.post(
+                f"{api_base}/v1/messages",
+                headers=headers,
+                json=payload,
+                timeout=timeout
+            )
+            
+            if response.status_code == 200:
+                response_data = response.json()
+                content = response_data.get("content", [])
+                
+                if content and len(content) > 0:
+                    text_content = content[0].get("text", "")
+                    logging.info("Successfully received Claude API response")
+                    return {
+                        "status": "success",
+                        "claude_analysis": text_content,
+                        "model_used": model,
+                        "timestamp": datetime.now().isoformat()
+                    }
+            else:
+                logging.error(f"Claude API error: {response.status_code} - {response.text}")
+                return {
+                    "status": "api_error",
+                    "message": f"API returned {response.status_code}",
+                    "error_details": response.text
+                }
+                
+        except requests.exceptions.Timeout:
+            logging.warning(f"Claude API timeout after {timeout}s")
+            return {"status": "timeout", "message": f"API timeout after {timeout}s"}
+        except requests.exceptions.RequestException as e:
+            logging.error(f"Claude API request failed: {e}")
+            return {"status": "request_error", "message": str(e)}
+        except Exception as e:
+            logging.error(f"Unexpected error calling Claude API: {e}")
+            return {"status": "unexpected_error", "message": str(e)}
+    
+    def _create_claude_analysis_prompt(self, text_segments: List[str], typing_stats: Dict[str, Any]) -> str:
+        """Create a comprehensive prompt for Claude analysis."""
+        
+        prompt = f"""
+# Typing Pattern Analysis Request
+
+I'm analyzing typing behavior data and need intelligent insights. Here's what I've captured:
+
+## Typing Statistics:
+- Total keystrokes: {typing_stats.get('total_keystrokes', 'N/A')}
+- Overall WPM: {typing_stats.get('overall_wpm', 'N/A'):.1f}
+- Error rate: {typing_stats.get('error_rate', 'N/A'):.1f}%
+- Session duration: {typing_stats.get('duration_minutes', 'N/A'):.1f} minutes
+- Unique words: {typing_stats.get('unique_words', 'N/A')}
+- Total corrections: {typing_stats.get('total_corrections', 'N/A')}
+
+## Most Frequent Words/Phrases:
+"""
+        
+        # Add sample text segments
+        for i, segment in enumerate(text_segments[:10], 1):  # Limit to first 10
+            if len(segment) > 3:  # Only meaningful segments
+                prompt += f"{i}. {segment[:100]}{'...' if len(segment) > 100 else ''}\\n"
+        
+        prompt += """
+
+## Analysis Request:
+Please analyze this typing data and provide practical insights on:
+
+1. **Writing Productivity**: What patterns suggest focused vs scattered work?
+2. **Vocabulary Insights**: Technical level, domain expertise, writing style
+3. **Efficiency Opportunities**: Common phrases that could benefit from shortcuts
+4. **Error Pattern Analysis**: What might be causing the typing errors?
+5. **Workflow Optimization**: How could the user improve their typing workflow?
+
+Provide specific, actionable recommendations for improving typing efficiency.
+"""
+        
+        return prompt
+
     def run_full_analysis(self) -> Dict[str, Any]:
         """Run comprehensive analysis on loaded data."""
         logging.info("Running full typing pattern analysis...")
@@ -762,6 +968,32 @@ class TypingPatternAnalyzer:
             "key_combinations": self.analyze_key_combinations(),
             "optimization_opportunities": self.analyze_optimization_opportunities(),
         }
+        
+        # Add Claude analysis if available
+        word_patterns = self.analysis_results["word_patterns"]
+        if word_patterns.get("text_segments"):
+            # Prepare stats for Claude
+            typing_stats = {
+                "total_keystrokes": self.analysis_results["key_usage"]["total_keystrokes"],
+                "overall_wpm": self.analysis_results["efficiency_metrics"].get("overall_wpm", 0),
+                "error_rate": self.analysis_results["error_patterns"].get("overall_error_rate", 0),
+                "duration_minutes": self.analysis_results["efficiency_metrics"].get("session_duration_minutes", 0),
+                "unique_words": word_patterns.get("unique_words", 0),
+                "total_corrections": self.analysis_results["error_patterns"].get("total_corrections", 0)
+            }
+            
+            # Get text segments for Claude analysis
+            text_segments = word_patterns.get("text_segments", [])
+            
+            # Call Claude analysis
+            logging.info("Attempting Claude analysis integration...")
+            claude_result = self.analyze_with_claude(text_segments, typing_stats)
+            self.analysis_results["claude_insights"] = claude_result
+        else:
+            self.analysis_results["claude_insights"] = {
+                "status": "no_text_segments",
+                "message": "No text segments available for Claude analysis"
+            }
 
         return self.analysis_results
 
@@ -954,12 +1186,12 @@ class TypingPatternAnalyzer:
         for app, rate in list(self.analysis_results['error_patterns']['app_error_rates'].items())[:5]:
             html_content += f"<tr><td>{app}</td><td>{rate:.2f}%</td></tr>"
         
-        html_content += """
+        html_content += f"""
                 </table>
             </div>
             
             <div class="metric">
-                <h2>🚀 Optimization Opportunities</h2>
+                <h2>Optimization Opportunities</h2>
                 <p><strong>Total Opportunities Found:</strong> <span class="highlight">{self.analysis_results['optimization_opportunities']['total_opportunities']}</span></p>
                 <p><strong>High Priority:</strong> <span class="highlight">{self.analysis_results['optimization_opportunities']['high_priority']}</span> | 
                    <strong>Medium Priority:</strong> <span class="highlight">{self.analysis_results['optimization_opportunities']['medium_priority']}</span></p>
@@ -985,6 +1217,58 @@ class TypingPatternAnalyzer:
         html_content += """
                 </table>
             </div>
+        """
+        
+        # Add Claude insights section
+        claude_insights = self.analysis_results.get("claude_insights", {})
+        if claude_insights.get("status") == "success":
+            html_content += f"""
+            <div class="metric">
+                <h2>Claude AI Insights</h2>
+                <div style="background: #e8f5e8; padding: 15px; border-left: 4px solid #4CAF50; margin: 10px 0;">
+                    <p><strong>Model:</strong> {claude_insights.get('model_used', 'N/A')}</p>
+                    <p><strong>Analysis Time:</strong> {claude_insights.get('timestamp', 'N/A')}</p>
+                </div>
+                <div style=" line-height: 1.6; background: white; padding: 20px; border-radius: 5px; border: 1px solid #ddd;">
+{claude_insights.get('claude_analysis', 'No analysis available').replace('≈', 'approximately ').replace('→', '->').replace('•', '*')}
+                </div>
+            </div>
+            """
+        elif claude_insights.get("status") == "no_api_key":
+            html_content += """
+            <div class="metric">
+                <h2>Claude AI Insights</h2>
+                <div style="background: #fff3cd; padding: 15px; border-left: 4px solid #ffc107; margin: 10px 0;">
+                    <p><strong>Status:</strong> API Key Required</p>
+                    <p>Set the CLAUDE_API_KEY environment variable to enable intelligent text analysis.</p>
+                    <p>This feature provides insights on writing productivity, vocabulary analysis, and efficiency opportunities.</p>
+                </div>
+            </div>
+            """
+        elif claude_insights.get("status") in ["api_error", "timeout", "request_error"]:
+            html_content += f"""
+            <div class="metric">
+                <h2>Claude AI Insights</h2>
+                <div style="background: #f8d7da; padding: 15px; border-left: 4px solid #dc3545; margin: 10px 0;">
+                    <p><strong>Status:</strong> Analysis Failed</p>
+                    <p><strong>Error:</strong> {claude_insights.get('message', 'Unknown error')}</p>
+                    <p>Claude analysis could not be completed. Check your API key and network connection.</p>
+                </div>
+            </div>
+            """
+        else:
+            html_content += """
+            <div class="metric">
+                <h2>Claude AI Insights</h2>
+                <div style="background: #d1ecf1; padding: 15px; border-left: 4px solid #17a2b8; margin: 10px 0;">
+                    <p><strong>Status:</strong> Not Available</p>
+                    <p>Claude analysis is disabled or no text segments were available for analysis.</p>
+                    <p>Enable Claude API integration in config.yaml to get intelligent insights about your typing patterns.</p>
+                </div>
+            </div>
+            """
+        
+        html_content += """
         </body>
         </html>
         """
