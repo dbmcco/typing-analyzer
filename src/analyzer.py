@@ -18,6 +18,7 @@ except ImportError:
 
 import pandas as pd
 import numpy as np
+import html
 
 try:
     from .utils import (
@@ -180,13 +181,11 @@ class TypingPatternAnalyzer:
         if not self.events:
             return {}
 
-        # Time-based analysis
-        session_duration = (
-            self.events[-1].timestamp - self.events[0].timestamp
-        ) / 60  # minutes
-
-        # WPM calculation
-        overall_wpm = calculate_wpm(self.events, session_duration * 60)
+        # Calculate active typing sessions (gaps > 5 minutes = new session)
+        active_duration_minutes = self._calculate_active_typing_duration()
+        
+        # WPM calculation using active duration
+        overall_wpm = calculate_wpm(self.events, active_duration_minutes * 60)
 
         # App-specific WPM
         app_events = defaultdict(list)
@@ -226,7 +225,7 @@ class TypingPatternAnalyzer:
 
         return {
             "overall_wpm": overall_wpm,
-            "session_duration_minutes": session_duration,
+            "session_duration_minutes": active_duration_minutes,
             "app_specific_wpm": app_wpm,
             "burst_typing_percentage": burst_percentage,
             "flow_state_periods": flow_periods,
@@ -897,6 +896,236 @@ class TypingPatternAnalyzer:
             logging.error(f"Unexpected error calling Claude API: {e}")
             return {"status": "unexpected_error", "message": str(e)}
     
+    def analyze_sessions(self) -> Dict[str, Any]:
+        """Analyze individual typing sessions and session-to-session changes."""
+        sessions = self._identify_typing_sessions()
+        
+        if not sessions:
+            return {"sessions": [], "session_trends": {}}
+        
+        # Number the sessions chronologically
+        for i, session in enumerate(sessions, 1):
+            session['session_number'] = i
+        
+        # Calculate session-to-session changes
+        session_trends = self._calculate_session_trends(sessions)
+        
+        return {
+            "sessions": sessions,
+            "session_trends": session_trends,
+            "total_sessions": len(sessions),
+            "average_session_duration": statistics.mean([s['duration_minutes'] for s in sessions]),
+            "best_session_wpm": max([s['wpm'] for s in sessions]) if sessions else 0,
+            "worst_session_wpm": min([s['wpm'] for s in sessions]) if sessions else 0,
+            "best_session_accuracy": max([s['accuracy_rate'] for s in sessions]) if sessions else 0,
+            "worst_session_accuracy": min([s['accuracy_rate'] for s in sessions]) if sessions else 0,
+        }
+    
+    def _calculate_session_trends(self, sessions: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Calculate trends and changes between sessions."""
+        if len(sessions) < 2:
+            return {"trend_analysis": "Insufficient sessions for trend analysis"}
+        
+        # Calculate changes between consecutive sessions
+        wpm_changes = []
+        accuracy_changes = []
+        duration_changes = []
+        
+        for i in range(1, len(sessions)):
+            prev_session = sessions[i-1]
+            curr_session = sessions[i]
+            
+            wpm_change = curr_session['wpm'] - prev_session['wpm']
+            accuracy_change = curr_session['accuracy_rate'] - prev_session['accuracy_rate']
+            duration_change = curr_session['duration_minutes'] - prev_session['duration_minutes']
+            
+            wpm_changes.append(wpm_change)
+            accuracy_changes.append(accuracy_change)
+            duration_changes.append(duration_change)
+        
+        # Overall trends
+        wpm_trend = "improving" if statistics.mean(wpm_changes) > 0 else "declining" if statistics.mean(wpm_changes) < 0 else "stable"
+        accuracy_trend = "improving" if statistics.mean(accuracy_changes) > 0 else "declining" if statistics.mean(accuracy_changes) < 0 else "stable"
+        
+        # Consistency metrics
+        wpm_consistency = 1 / (statistics.stdev([s['wpm'] for s in sessions]) + 0.1)  # Add small value to avoid division by zero
+        accuracy_consistency = 1 / (statistics.stdev([s['accuracy_rate'] for s in sessions]) + 0.1)
+        
+        return {
+            "wpm_trend": wpm_trend,
+            "accuracy_trend": accuracy_trend,
+            "avg_wpm_change_per_session": statistics.mean(wpm_changes),
+            "avg_accuracy_change_per_session": statistics.mean(accuracy_changes),
+            "wpm_consistency_score": wpm_consistency,
+            "accuracy_consistency_score": accuracy_consistency,
+            "session_to_session_changes": [
+                {
+                    "from_session": i,
+                    "to_session": i + 1,
+                    "wpm_change": wpm_changes[i-1],
+                    "accuracy_change": accuracy_changes[i-1],
+                    "duration_change": duration_changes[i-1],
+                } for i in range(1, len(sessions))
+            ]
+        }
+    
+    def _calculate_active_typing_duration(self) -> float:
+        """Calculate actual active typing duration by identifying sessions with gaps > 5 minutes."""
+        sessions_data = self._identify_typing_sessions()
+        return sum(session['duration_minutes'] for session in sessions_data)
+    
+    def _identify_typing_sessions(self) -> List[Dict[str, Any]]:
+        """Identify individual typing sessions using intelligent gap detection for all-day tracking."""
+        if not self.events or len(self.events) < 2:
+            return []
+        
+        # Get configurable thresholds for smart session detection
+        all_day_mode = self.config.get("session_detection.all_day_tracking_mode", True)
+        
+        if all_day_mode:
+            # Smart all-day tracking with multiple thresholds
+            short_pause = self.config.get("session_detection.short_pause_threshold", 120)     # 2 min
+            medium_pause = self.config.get("session_detection.medium_pause_threshold", 900)   # 15 min  
+            long_pause = self.config.get("session_detection.long_pause_threshold", 1800)     # 30 min
+            session_gap_threshold = long_pause  # Only long pauses create new sessions
+        else:
+            # Original 5-minute threshold for backward compatibility
+            session_gap_threshold = 5 * 60
+        
+        sessions = []
+        current_session_events = [self.events[0]]
+        short_pauses = 0
+        medium_pauses = 0
+        long_pauses = 0
+        
+        for i in range(1, len(self.events)):
+            time_gap = self.events[i].timestamp - self.events[i-1].timestamp
+            
+            # Count pause types for debugging
+            if all_day_mode:
+                if time_gap > long_pause:
+                    long_pauses += 1
+                elif time_gap > medium_pause:
+                    medium_pauses += 1
+                elif time_gap > short_pause:
+                    short_pauses += 1
+            
+            if time_gap > session_gap_threshold:
+                # End current session and analyze it
+                if len(current_session_events) > 1:
+                    session_data = self._analyze_session(current_session_events)
+                    sessions.append(session_data)
+                
+                # Start new session
+                current_session_events = [self.events[i]]
+            else:
+                # Continue current session (includes short and medium pauses in all-day mode)
+                current_session_events.append(self.events[i])
+        
+        # Don't forget the last session
+        if len(current_session_events) > 1:
+            session_data = self._analyze_session(current_session_events)
+            sessions.append(session_data)
+        
+        # Enhanced logging for all-day tracking
+        logging.info(f"Found {len(sessions)} active typing sessions")
+        logging.info(f"Total active typing time: {sum(s['duration_minutes'] for s in sessions):.1f} minutes")
+        if all_day_mode:
+            logging.info(f"Pause analysis - Short: {short_pauses}, Medium: {medium_pauses}, Long: {long_pauses}")
+            logging.info(f"Session gap threshold: {session_gap_threshold/60:.1f} minutes")
+        
+        return sessions
+    
+    def _analyze_session(self, session_events: List[KeystrokeEvent]) -> Dict[str, Any]:
+        """Analyze a single typing session and return comprehensive metrics."""
+        if len(session_events) < 2:
+            return {}
+        
+        from datetime import datetime
+        
+        # Basic session info
+        start_time = session_events[0].timestamp
+        end_time = session_events[-1].timestamp
+        total_duration_seconds = end_time - start_time
+        total_duration_minutes = total_duration_seconds / 60
+        
+        # Calculate net active typing time (exclude pauses > 30 seconds)
+        active_duration_seconds = 0
+        pause_threshold = 30  # seconds
+        
+        for i in range(1, len(session_events)):
+            interval = session_events[i].timestamp - session_events[i-1].timestamp
+            if interval <= pause_threshold:
+                active_duration_seconds += interval
+        
+        # If we have very few intervals, use total duration as fallback
+        if active_duration_seconds < total_duration_seconds * 0.1:
+            active_duration_seconds = total_duration_seconds
+        
+        active_duration_minutes = active_duration_seconds / 60
+        
+        # WPM calculation using active typing time for accuracy
+        session_wpm = calculate_wpm(session_events, active_duration_seconds)
+        
+        # Error analysis for this session
+        corrections = sum(1 for event in session_events if event.is_correction)
+        total_keystrokes = len(session_events)
+        error_rate = (corrections / total_keystrokes * 100) if total_keystrokes > 0 else 0
+        accuracy_rate = 100 - error_rate
+        
+        # Character count (alphanumeric only for word calculation)
+        char_count = sum(1 for event in session_events if len(event.key_char) == 1 and event.key_char.isalnum())
+        word_count = char_count / 5  # Standard 5 chars = 1 word
+        
+        # Application context
+        apps_used = set(event.app_name for event in session_events if event.app_name)
+        primary_app = max(apps_used, key=lambda app: sum(1 for e in session_events if e.app_name == app)) if apps_used else "Unknown"
+        
+        # Typing rhythm analysis
+        intervals = []
+        for i in range(1, len(session_events)):
+            interval = session_events[i].timestamp - session_events[i-1].timestamp
+            if interval < 2.0:  # Filter out long pauses
+                intervals.append(interval)
+        
+        avg_interval = statistics.mean(intervals) if intervals else 0
+        typing_rhythm_consistency = (1 / statistics.stdev(intervals)) if len(intervals) > 1 and statistics.stdev(intervals) > 0 else 0
+        
+        return {
+            'session_number': 0,  # Will be set by caller
+            'start_time': datetime.fromtimestamp(start_time).isoformat(),
+            'end_time': datetime.fromtimestamp(end_time).isoformat(),
+            'total_duration_minutes': total_duration_minutes,
+            'active_duration_minutes': active_duration_minutes,
+            'duration_minutes': active_duration_minutes,  # Backward compatibility
+            'duration_seconds': active_duration_seconds,  # Backward compatibility
+            'total_keystrokes': total_keystrokes,
+            'character_count': char_count,
+            'word_count': word_count,
+            'wpm': session_wpm,
+            'error_rate': error_rate,
+            'accuracy_rate': accuracy_rate,
+            'corrections': corrections,
+            'primary_app': primary_app,
+            'apps_used': list(apps_used),
+            'avg_keystroke_interval': avg_interval,
+            'typing_rhythm_consistency': typing_rhythm_consistency,
+        }
+    
+    def _convert_claude_html_to_display(self, claude_content: str) -> str:
+        """Convert Claude's HTML markup to properly formatted HTML for display."""
+        if not claude_content:
+            return "No analysis available"
+            
+        # Replace special characters that don't display well
+        content = claude_content.replace('≈', 'approximately ')
+        content = content.replace('→', '→')  # Keep arrow as HTML entity
+        content = content.replace('•', '•')  # Keep bullet as HTML entity
+        
+        # The content from Claude is already in HTML format, so we can use it directly
+        # but ensure it's properly formatted
+        return content
+    
     def _create_claude_analysis_prompt(self, text_segments: List[str], typing_stats: Dict[str, Any]) -> str:
         """Create a comprehensive prompt for Claude analysis."""
         
@@ -967,6 +1196,7 @@ Provide specific, actionable recommendations for improving typing efficiency.
             "word_patterns": self.analyze_word_patterns(),
             "key_combinations": self.analyze_key_combinations(),
             "optimization_opportunities": self.analyze_optimization_opportunities(),
+            "session_analysis": self.analyze_sessions(),
         }
         
         # Add Claude analysis if available
@@ -1037,6 +1267,7 @@ Provide specific, actionable recommendations for improving typing efficiency.
         <html>
         <head>
             <title>Typing Pattern Analysis Report</title>
+            <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
             <style>
                 body {{ font-family: Arial, sans-serif; margin: 40px; }}
                 .metric {{ background: #f5f5f5; padding: 15px; margin: 10px 0; border-radius: 5px; }}
@@ -1044,68 +1275,145 @@ Provide specific, actionable recommendations for improving typing efficiency.
                 table {{ border-collapse: collapse; width: 100%; }}
                 th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
                 th {{ background-color: #f2f2f2; }}
+                .chart-container {{ 
+                    position: relative; 
+                    height: 400px; 
+                    width: 100%; 
+                    margin: 20px 0; 
+                }}
+                .claude-content {{
+                    background: white; 
+                    padding: 20px; 
+                    border-radius: 5px; 
+                    border: 1px solid #ddd;
+                    line-height: 1.6;
+                }}
+                .key-metrics {{
+                    display: flex;
+                    justify-content: space-around;
+                    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white;
+                    padding: 30px;
+                    border-radius: 10px;
+                    margin: 20px 0;
+                    text-align: center;
+                }}
+                .metric-card {{
+                    flex: 1;
+                    padding: 0 20px;
+                }}
+                .metric-value {{
+                    font-size: 2.5em;
+                    font-weight: bold;
+                    margin: 10px 0;
+                }}
+                .metric-label {{
+                    font-size: 1.1em;
+                    opacity: 0.9;
+                }}
+                .charts-row {{
+                    display: flex;
+                    gap: 20px;
+                    margin: 20px 0;
+                }}
+                .chart-half {{
+                    flex: 1;
+                    background: #f5f5f5;
+                    padding: 15px;
+                    border-radius: 5px;
+                }}
+                .chart-half .chart-container {{
+                    height: 350px;
+                }}
             </style>
         </head>
         <body>
             <h1>Typing Pattern Analysis Report</h1>
             <p>Generated: {self.analysis_results['metadata']['analysis_timestamp']}</p>
             
-            <div class="metric">
-                <h2>Summary Statistics</h2>
-                <p>Total Keystrokes: <span class="highlight">{self.analysis_results['key_usage']['total_keystrokes']:,}</span></p>
-                <p>Overall WPM: <span class="highlight">{self.analysis_results['efficiency_metrics'].get('overall_wpm', 0):.1f}</span></p>
-                <p>Efficiency Ratio: <span class="highlight">{self.analysis_results['efficiency_metrics'].get('efficiency_ratio', 0):.1f}%</span></p>
-                <p>Session Duration: <span class="highlight">{self.analysis_results['efficiency_metrics'].get('session_duration_minutes', 0):.1f} minutes</span></p>
+            <div class="key-metrics">
+                <div class="metric-card">
+                    <div class="metric-value">{self.analysis_results['efficiency_metrics'].get('overall_wpm', 0):.1f}</div>
+                    <div class="metric-label">Words Per Minute</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value">{100 - self.analysis_results['error_patterns']['overall_error_rate']:.1f}%</div>
+                    <div class="metric-label">Accuracy Rate</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value">{self.analysis_results['error_patterns']['overall_error_rate']:.1f}%</div>
+                    <div class="metric-label">Error Rate</div>
+                </div>
+                <div class="metric-card">
+                    <div class="metric-value">{self.analysis_results['key_usage']['total_keystrokes']:,}</div>
+                    <div class="metric-label">Total Keystrokes</div>
+                </div>
+            </div>
+            
+            <div class="charts-row">
+                <div class="chart-half">
+                    <h2>Character Frequency</h2>
+                    <div class="chart-container">
+                        <canvas id="charFrequencyChart"></canvas>
+                    </div>
+                </div>
+                <div class="chart-half">
+                    <h2>Finger Usage Distribution</h2>
+                    <div class="chart-container">
+                        <canvas id="fingerUsageChart"></canvas>
+                    </div>
+                </div>
             </div>
             
             <div class="metric">
-                <h2>Most Frequent Characters</h2>
-                <table>
-                    <tr><th>Character</th><th>Count</th><th>Percentage</th></tr>
-        """
+                <h2>Session Analysis & Progress Tracking</h2>
+                <div class="charts-row">
+                    <div class="chart-half">
+                        <h3>Session Timeline</h3>
+                        <div class="chart-container">
+                            <canvas id="sessionTimelineChart"></canvas>
+                        </div>
+                    </div>
+                    <div class="chart-half">
+                        <h3>Individual Sessions</h3>
+                        <table style="font-size: 0.9em;">
+                            <tr><th>Session</th><th>Time</th><th>Duration</th><th>WPM</th><th>Accuracy</th><th>App</th></tr>"""
 
-        # Add most frequent characters
-        most_frequent = self.analysis_results["key_usage"]["most_frequent_chars"]
-        for char, count in most_frequent[:10]:
-            char_frequencies = self.analysis_results["key_usage"]["character_frequencies"]
-            percentage = char_frequencies.get(char, 0)
-            html_content += (
-                f"<tr><td>{char}</td><td>{count}</td><td>{percentage:.2f}%</td></tr>"
-            )
+        # Add individual session data
+        sessions = self.analysis_results.get('session_analysis', {}).get('sessions', [])
+        for session in sessions:
+            start_time = session['start_time'][:16].replace('T', ' ')  # Format: YYYY-MM-DD HH:MM
+            html_content += f"""<tr>
+                <td>#{session['session_number']}</td>
+                <td>{start_time}</td>
+                <td>{session['duration_minutes']:.1f}m</td>
+                <td>{session['wpm']:.1f}</td>
+                <td>{session['accuracy_rate']:.1f}%</td>
+                <td>{session['primary_app']}</td>
+            </tr>"""
 
-        html_content += """
-                </table>
+        # Add session trends summary
+        session_trends = self.analysis_results.get('session_analysis', {}).get('session_trends', {})
+        html_content += f"""
+                        </table>
+                        <div style="margin-top: 15px; padding: 10px; background: #f9f9f9; border-radius: 5px;">
+                            <h4>Session Trends</h4>
+                            <p><strong>WPM Trend:</strong> {session_trends.get('wpm_trend', 'N/A').title()}</p>
+                            <p><strong>Accuracy Trend:</strong> {session_trends.get('accuracy_trend', 'N/A').title()}</p>
+                            <p><strong>Avg WPM Change:</strong> {session_trends.get('avg_wpm_change_per_session', 0):.1f} per session</p>
+                            <p><strong>Avg Accuracy Change:</strong> {session_trends.get('avg_accuracy_change_per_session', 0):.1f}% per session</p>
+                        </div>
+                    </div>
+                </div>
             </div>
             
             <div class="metric">
-                <h2>Finger Usage Distribution</h2>
-                <table>
-                    <tr><th>Finger</th><th>Usage Count</th><th>Percentage</th></tr>
-        """
-
-        # Add finger usage data
-        finger_usage = self.analysis_results["finger_usage"]["finger_usage_counts"]
-        finger_percentages = self.analysis_results["finger_usage"]["finger_usage_percentages"]
-
-        for finger, count in sorted(
-            finger_usage.items(), key=lambda x: x[1], reverse=True
-        ):
-            percentage = finger_percentages.get(finger, 0)
-            html_content += (
-                f"<tr><td>{finger.replace('_', ' ').title()}</td>"
-                f"<td>{count}</td><td>{percentage:.2f}%</td></tr>"
-            )
-
-        html_content += """
-                </table>
-            </div>
-            
-            <div class="metric">
-                <h2>Word & Phrase Patterns</h2>
-                <h3>Most Frequent Words</h3>
-                <table>
-                    <tr><th>Word</th><th>Count</th><th>Percentage</th></tr>
-        """
+                <h2>Word Patterns & Key Combinations</h2>
+                <div class="charts-row">
+                    <div class="chart-half">
+                        <h3>Most Frequent Words</h3>
+                        <table>
+                            <tr><th>Word</th><th>Count</th><th>Percentage</th></tr>"""
         
         # Add word frequency data
         for word, count in self.analysis_results['word_patterns']['most_frequent_words'][:10]:
@@ -1113,81 +1421,91 @@ Provide specific, actionable recommendations for improving typing efficiency.
             html_content += f"<tr><td>{word}</td><td>{count}</td><td>{percentage:.2f}%</td></tr>"
         
         html_content += """
-                </table>
-                
-                <h3>Most Frequent Phrases</h3>
-                <table>
-                    <tr><th>Phrase</th><th>Count</th></tr>
-        """
+                        </table>
+                        
+                        <h3>Most Frequent Phrases</h3>
+                        <table>
+                            <tr><th>Phrase</th><th>Count</th></tr>"""
         
-        # Add phrase frequency data
+        # Add phrase frequency data  
         for phrase, count in self.analysis_results['word_patterns']['most_frequent_bigrams'][:5]:
             html_content += f"<tr><td>{phrase}</td><td>{count}</td></tr>"
         
         html_content += """
-                </table>
-            </div>
-            
-            <div class="metric">
-                <h2>Key Combinations & Efficiency</h2>
-                <h3>Most Common Character Sequences</h3>
-                <table>
-                    <tr><th>Sequence</th><th>Count</th></tr>
-        """
+                        </table>
+                    </div>
+                    <div class="chart-half">
+                        <h3>Most Common Character Sequences</h3>
+                        <table>
+                            <tr><th>Sequence</th><th>Count</th></tr>"""
         
         # Add key combination data
         for sequence, count in self.analysis_results['key_combinations']['most_common_bigrams'][:10]:
             html_content += f"<tr><td>{sequence}</td><td>{count}</td></tr>"
         
         html_content += f"""
-                </table>
-                <p><strong>Hand Alternation Rate:</strong> <span class="highlight">{self.analysis_results['key_combinations']['hand_alternation_rate']:.1f}%</span></p>
-                <p><strong>Typing Efficiency Score:</strong> <span class="highlight">{self.analysis_results['key_combinations']['efficiency_score']:.1f}%</span></p>
+                        </table>
+                        
+                        <h3>Efficiency Metrics</h3>
+                        <div style="padding: 10px; background: #f9f9f9; border-radius: 5px; margin-top: 10px;">
+                            <p><strong>Hand Alternation Rate:</strong> <span class="highlight">{self.analysis_results['key_combinations']['hand_alternation_rate']:.1f}%</span></p>
+                            <p><strong>Typing Efficiency Score:</strong> <span class="highlight">{self.analysis_results['key_combinations']['efficiency_score']:.1f}%</span></p>
+                        </div>
+                    </div>
+                </div>
             </div>
             
             <div class="metric">
-                <h2>⚠️ Error Analysis & Corrections</h2>
-                <p><strong>Overall Error Rate:</strong> <span class="highlight">{self.analysis_results['error_patterns']['overall_error_rate']:.2f}%</span></p>
-                <p><strong>Total Corrections:</strong> <span class="highlight">{self.analysis_results['error_patterns']['total_corrections']:,}</span></p>
-                <p><strong>Correction Sequences:</strong> <span class="highlight">{self.analysis_results['error_patterns']['correction_sequences']}</span></p>
-                <p><strong>Typos Detected:</strong> <span class="highlight">{self.analysis_results['error_patterns']['likely_typos_detected']}</span></p>
-                <p><strong>Correction Efficiency:</strong> <span class="highlight">{self.analysis_results['error_patterns']['correction_efficiency']:.3f}</span></p>
+                <h2>Error Analysis & Corrections</h2>
+                <div style="display: flex; justify-content: space-around; background: #f9f9f9; padding: 15px; border-radius: 5px; margin-bottom: 20px;">
+                    <div><strong>Overall Error Rate:</strong> <span class="highlight">{self.analysis_results['error_patterns']['overall_error_rate']:.2f}%</span></div>
+                    <div><strong>Total Corrections:</strong> <span class="highlight">{self.analysis_results['error_patterns']['total_corrections']:,}</span></div>
+                    <div><strong>Typos Detected:</strong> <span class="highlight">{self.analysis_results['error_patterns']['likely_typos_detected']}</span></div>
+                    <div><strong>Correction Efficiency:</strong> <span class="highlight">{self.analysis_results['error_patterns']['correction_efficiency']:.3f}</span></div>
+                </div>
                 
-                <h3>Error-Prone Characters</h3>
-                <table>
-                    <tr><th>Character</th><th>Errors Before</th></tr>
-        """
+                <div class="charts-row">
+                    <div class="chart-half">
+                        <h3>Error-Prone Characters</h3>
+                        <table>
+                            <tr><th>Character</th><th>Errors Before</th></tr>"""
         
         # Add error-prone characters
         for char, count in list(self.analysis_results['error_patterns']['error_prone_chars'].items())[:5]:
             html_content += f"<tr><td>{char}</td><td>{count}</td></tr>"
         
         html_content += """
-                </table>
-                
-                <h3>Common Typo Patterns</h3>
-                <table>
-                    <tr><th>Typo Pattern</th><th>Occurrences</th></tr>
-        """
+                        </table>
+                        
+                        <h3>Common Typo Patterns</h3>
+                        <table>
+                            <tr><th>Typo Pattern</th><th>Occurrences</th></tr>"""
         
         # Add typo patterns
         for pattern, count in list(self.analysis_results['error_patterns']['typo_patterns'].items())[:5]:
             html_content += f"<tr><td>{pattern}</td><td>{count}</td></tr>"
         
         html_content += """
-                </table>
-                
-                <h3>App-Specific Error Rates</h3>
-                <table>
-                    <tr><th>Application</th><th>Error Rate</th></tr>
-        """
+                        </table>
+                    </div>
+                    <div class="chart-half">
+                        <h3>App-Specific Error Rates</h3>
+                        <table>
+                            <tr><th>Application</th><th>Error Rate</th></tr>"""
         
         # Add app error rates
         for app, rate in list(self.analysis_results['error_patterns']['app_error_rates'].items())[:5]:
             html_content += f"<tr><td>{app}</td><td>{rate:.2f}%</td></tr>"
         
-        html_content += f"""
-                </table>
+        html_content += """
+                        </table>
+                        
+                        <div style="margin-top: 20px; padding: 10px; background: #fff3cd; border-left: 4px solid #ffc107; border-radius: 3px;">
+                            <h4 style="margin-top: 0;">Error Insights</h4>
+                            <p style="margin-bottom: 0; font-size: 0.9em;">Focus on characters with high error rates and practice common typo patterns to improve accuracy.</p>
+                        </div>
+                    </div>
+                </div>
             </div>
             
             <div class="metric">
@@ -1229,8 +1547,8 @@ Provide specific, actionable recommendations for improving typing efficiency.
                     <p><strong>Model:</strong> {claude_insights.get('model_used', 'N/A')}</p>
                     <p><strong>Analysis Time:</strong> {claude_insights.get('timestamp', 'N/A')}</p>
                 </div>
-                <div style=" line-height: 1.6; background: white; padding: 20px; border-radius: 5px; border: 1px solid #ddd;">
-{claude_insights.get('claude_analysis', 'No analysis available').replace('≈', 'approximately ').replace('→', '->').replace('•', '*')}
+                <div class="claude-content">
+{self._convert_claude_html_to_display(claude_insights.get('claude_analysis', 'No analysis available'))}
                 </div>
             </div>
             """
@@ -1268,7 +1586,167 @@ Provide specific, actionable recommendations for improving typing efficiency.
             </div>
             """
         
-        html_content += """
+        # Add JavaScript for charts
+        most_frequent = self.analysis_results["key_usage"]["most_frequent_chars"][:10]
+        char_labels = [char for char, _ in most_frequent]
+        char_counts = [count for _, count in most_frequent]
+        
+        finger_usage = self.analysis_results["finger_usage"]["finger_usage_counts"]
+        finger_labels = list(finger_usage.keys())[:10]  # Top 10 fingers
+        finger_counts = [finger_usage[finger] for finger in finger_labels]
+        
+        html_content += f"""
+        <script>
+        // Character Frequency Chart
+        const charCtx = document.getElementById('charFrequencyChart').getContext('2d');
+        const charChart = new Chart(charCtx, {{
+            type: 'bar',
+            data: {{
+                labels: {char_labels},
+                datasets: [{{
+                    label: 'Character Frequency',
+                    data: {char_counts},
+                    backgroundColor: 'rgba(33, 150, 243, 0.6)',
+                    borderColor: 'rgba(33, 150, 243, 1)',
+                    borderWidth: 1
+                }}]
+            }},
+            options: {{
+                responsive: true,
+                maintainAspectRatio: false,
+                scales: {{
+                    y: {{
+                        beginAtZero: true,
+                        title: {{
+                            display: true,
+                            text: 'Count'
+                        }}
+                    }},
+                    x: {{
+                        title: {{
+                            display: true,
+                            text: 'Characters'
+                        }}
+                    }}
+                }},
+                plugins: {{
+                    title: {{
+                        display: true,
+                        text: 'Most Frequent Characters'
+                    }}
+                }}
+            }}
+        }});
+
+        // Finger Usage Chart
+        const fingerCtx = document.getElementById('fingerUsageChart').getContext('2d');
+        const fingerChart = new Chart(fingerCtx, {{
+            type: 'doughnut',
+            data: {{
+                labels: {finger_labels},
+                datasets: [{{
+                    label: 'Finger Usage',
+                    data: {finger_counts},
+                    backgroundColor: [
+                        'rgba(255, 99, 132, 0.6)',
+                        'rgba(54, 162, 235, 0.6)',
+                        'rgba(255, 205, 86, 0.6)',
+                        'rgba(75, 192, 192, 0.6)',
+                        'rgba(153, 102, 255, 0.6)',
+                        'rgba(255, 159, 64, 0.6)',
+                        'rgba(199, 199, 199, 0.6)',
+                        'rgba(83, 102, 255, 0.6)',
+                        'rgba(255, 99, 255, 0.6)',
+                        'rgba(99, 255, 132, 0.6)'
+                    ],
+                    borderWidth: 1
+                }}]
+            }},
+            options: {{
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {{
+                    title: {{
+                        display: true,
+                        text: 'Finger Usage Distribution'
+                    }},
+                    legend: {{
+                        position: 'right'
+                    }}
+                }}
+            }}
+        }});
+
+        // Session Timeline Chart
+        const sessionCtx = document.getElementById('sessionTimelineChart').getContext('2d');
+        const sessions = {[session['session_number'] for session in sessions]};
+        const sessionWPMs = {[session['wpm'] for session in sessions]};
+        const sessionAccuracies = {[session['accuracy_rate'] for session in sessions]};
+        
+        const sessionChart = new Chart(sessionCtx, {{
+            type: 'line',
+            data: {{
+                labels: sessions.map(s => `Session ${{s}}`),
+                datasets: [{{
+                    label: 'WPM',
+                    data: sessionWPMs,
+                    borderColor: 'rgba(33, 150, 243, 1)',
+                    backgroundColor: 'rgba(33, 150, 243, 0.1)',
+                    yAxisID: 'y'
+                }}, {{
+                    label: 'Accuracy %',
+                    data: sessionAccuracies,
+                    borderColor: 'rgba(76, 175, 80, 1)',
+                    backgroundColor: 'rgba(76, 175, 80, 0.1)',
+                    yAxisID: 'y1'
+                }}]
+            }},
+            options: {{
+                responsive: true,
+                maintainAspectRatio: false,
+                interaction: {{
+                    mode: 'index',
+                    intersect: false,
+                }},
+                scales: {{
+                    x: {{
+                        display: true,
+                        title: {{
+                            display: true,
+                            text: 'Sessions'
+                        }}
+                    }},
+                    y: {{
+                        type: 'linear',
+                        display: true,
+                        position: 'left',
+                        title: {{
+                            display: true,
+                            text: 'Words Per Minute'
+                        }}
+                    }},
+                    y1: {{
+                        type: 'linear',
+                        display: true,
+                        position: 'right',
+                        title: {{
+                            display: true,
+                            text: 'Accuracy %'
+                        }},
+                        grid: {{
+                            drawOnChartArea: false,
+                        }},
+                    }}
+                }},
+                plugins: {{
+                    title: {{
+                        display: true,
+                        text: 'Session Progress - WPM & Accuracy Trends'
+                    }}
+                }}
+            }}
+        }});
+        </script>
         </body>
         </html>
         """
@@ -1394,7 +1872,7 @@ def main():
     # Show optimization opportunities
     if 'optimization_opportunities' in results:
         opportunities = results['optimization_opportunities']
-        print(f"\n=== 🚀 Optimization Opportunities ===")
+        print(f"\n=== Optimization Opportunities ===")
         print(f"Total Opportunities: {opportunities['total_opportunities']}")
         print(f"High Priority: {opportunities['high_priority']} | Medium Priority: {opportunities['medium_priority']}")
         print(f"Estimated Savings: {opportunities['estimated_total_savings']} keystrokes")
@@ -1402,8 +1880,8 @@ def main():
         if opportunities['opportunities']:
             print(f"\nTop Recommendations:")
             for i, opp in enumerate(opportunities['opportunities'][:3], 1):
-                priority_emoji = "🔴" if opp['priority'] == 'high' else "🟡" if opp['priority'] == 'medium' else "🟢"
-                print(f"  {i}. {priority_emoji} {opp['description']}")
+                priority_symbol = "HIGH" if opp['priority'] == 'high' else "MED" if opp['priority'] == 'medium' else "LOW"
+                print(f"  {i}. {priority_symbol} {opp['description']}")
                 print(f"     Savings: {opp['potential_savings']}")
                 print()
 

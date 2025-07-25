@@ -15,6 +15,13 @@ analysis:
   flow_state_threshold: 60
   accuracy_window_size: 100
   
+session_detection:
+  # Smart session gap detection for all-day tracking
+  short_pause_threshold: 120        # 2 minutes - thinking, reading (continue session)
+  medium_pause_threshold: 900       # 15 minutes - meeting, bathroom (continue session) 
+  long_pause_threshold: 1800        # 30 minutes - lunch, extended break (new session)
+  all_day_tracking_mode: true       # Enable intelligent all-day session detection
+  
 reporting:
   export_formats: ['html', 'csv', 'json']
   visualization_types: ['heatmap', 'timeline', 'distribution', 'correlation']
